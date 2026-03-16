@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# git-worktrees:
+#   no args -> scan ~/ (max depth 3) for git repos,
+#              let you pick a repo, then a worktree inside it, and cd there.
+# Source this script to change directory: source git-worktrees
+
+_gitwt_die() {
+  echo "git-worktrees: $*" >&2
+  if [[ -n "$ZSH_VERSION" ]]; then
+    [[ "$ZSH_EVAL_CONTEXT" == *"source"* ]] && return 1 || exit 1
+  else
+    [[ "${BASH_SOURCE[0]}" != "${0}" ]] && return 1 || exit 1
+  fi
+}
+
+# First array index (0 in bash, 1 in zsh)
+_gitwt_first() {
+  [[ -n "$ZSH_VERSION" ]] && echo 1 || echo 0
+}
+
+# Collect repos under ~ (max depth 3) that have at least one worktree.
+# Emits lines: repoName<TAB>repoRoot
+_gitwt_collect_repos() {
+  local home="$HOME"
+  local gitdir root repo_name
+
+  while IFS= read -r gitdir; do
+    root="${gitdir%/.git}"
+    repo_name="${root##*/}"
+
+    # Only keep repos where git worktree list returns something
+    if git -C "$root" worktree list >/dev/null 2>&1; then
+      printf "%s\t%s\n" "$repo_name" "$root"
+    fi
+  done < <(
+    find "$home" -maxdepth 3 -type d -name .git 2>/dev/null
+  )
+}
+
+# Collect all worktrees for a single repo root.
+# Emits lines: label<TAB>path
+_gitwt_collect_worktrees_for_repo() {
+  local root="$1"
+  local repo_name="${root##*/}"
+  local line wt_path head branch detached is_main
+
+  wt_path=""
+  head=""
+  branch=""
+  detached=0
+
+  _gitwt_flush_block() {
+    [[ -z "$wt_path" ]] && return
+    # Determine label for this worktree
+    if [[ "$wt_path" == "$root" ]]; then
+      is_main=" (main)"
+    else
+      is_main=""
+    fi
+
+    local base_label
+    if [[ -n "$branch" ]]; then
+      base_label="$branch"
+    elif (( detached == 1 )); then
+      base_label="${head:0:8} (detached)"
+    else
+      base_label="${head:0:8}"
+    fi
+
+    printf "%s\t%s\n" "$repo_name: $base_label$is_main" "$wt_path"
+  }
+
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *)
+        # New block: flush previous, then start new
+        _gitwt_flush_block
+        wt_path=${line#worktree }
+        head=""
+        branch=""
+        detached=0
+        ;;
+      HEAD\ *)
+        head=${line#HEAD }
+        ;;
+      branch\ *)
+        branch=${line#branch }
+        ;;
+      detached)
+        detached=1
+        ;;
+    esac
+  done < <(git -C "$root" worktree list --porcelain 2>/dev/null || true)
+
+  # Flush last block
+  _gitwt_flush_block
+}
+
+if [[ $# -ne 0 ]]; then
+  _gitwt_die "args not supported yet; run with no args"
+fi
+
+### Step 1: pick a repo
+repo_lines=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && repo_lines+=("$line")
+done <<< "$(_gitwt_collect_repos)"
+
+if [[ ${#repo_lines[@]} -eq 0 ]]; then
+  _gitwt_die "no git repos with worktrees found under ~ (depth <= 3)"
+fi
+
+first=$(_gitwt_first)
+if [[ ${#repo_lines[@]} -eq 1 ]]; then
+  repo_root="${repo_lines[$first]#*$'\t'}"
+else
+  # If fzf exists, use it to pick repo; otherwise numbered list
+  if command -v fzf >/dev/null 2>&1; then
+    repo_selection=$(
+      while IFS= read -r line; do
+        name="${line%%$'\t'*}"
+        root="${line#*$'\t'}"
+        echo "$name — $root"
+      done <<< "$(printf '%s\n' "${repo_lines[@]}")" | fzf --height=20 --prompt='repo> ' --no-info 2>/dev/null
+    )
+    if [[ -z "$repo_selection" ]]; then
+      return 0 2>/dev/null || exit 0
+    fi
+    repo_root="${repo_selection#* — }"
+  else
+    repo_choices=()
+    n=1
+    for line in "${repo_lines[@]}"; do
+      name="${line%%$'\t'*}"
+      root="${line#*$'\t'}"
+      repo_choices+=("$root")
+      echo "  $n) $name — $root" >&2
+      ((n++))
+    done
+    echo "" >&2
+    printf 'Choose repo (number): ' >&2
+    read -r num
+    case "$num" in
+      *[!0-9]*) _gitwt_die "invalid repo choice: $num" ;;
+      '')       _gitwt_die "invalid repo choice" ;;
+    esac
+    if (( num >= 1 && num <= ${#repo_choices[@]} )); then
+      [[ -n "$ZSH_VERSION" ]] && repo_root="${repo_choices[num]}" || repo_root="${repo_choices[num - 1]}"
+    else
+      _gitwt_die "invalid repo choice: $num"
+    fi
+  fi
+fi
+
+### Step 2: pick a worktree within that repo (including detached)
+wt_lines=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && wt_lines+=("$line")
+done <<< "$(_gitwt_collect_worktrees_for_repo "$repo_root")"
+
+# Sort worktrees: main worktree first, then other branch-backed, then detached HEAD.
+# We treat labels containing "(main)" as highest priority, "(detached)" as lowest.
+if ((${#wt_lines[@]} > 1)); then
+  sorted_wt_lines=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && sorted_wt_lines+=("$line")
+  done < <(
+    printf '%s\n' "${wt_lines[@]}" | awk -F '\t' '
+      {
+        if (index($1, "(main)")) {
+          cat = 1;
+        } else if (index($1, "(detached)")) {
+          cat = 3;
+        } else {
+          cat = 2;
+        }
+        print cat "\t" $0
+      }
+    ' | sort -t $'\t' -k1,1n -k2,2 | cut -f2-
+  )
+  wt_lines=("${sorted_wt_lines[@]}")
+  unset sorted_wt_lines
+fi
+
+if [[ ${#wt_lines[@]} -eq 0 ]]; then
+  _gitwt_die "no worktrees found for repo: $repo_root"
+fi
+
+if [[ ${#wt_lines[@]} -eq 1 ]]; then
+  dir="${wt_lines[$first]#*$'\t'}"
+  builtin cd "$dir" || _gitwt_die "cd failed: $dir"
+  return 0 2>/dev/null || exit 0
+fi
+
+# If fzf exists, use it; otherwise use numbered menu for worktrees
+if command -v fzf >/dev/null 2>&1; then
+  wt_selection=$(
+    while IFS= read -r line; do
+      label="${line%%$'\t'*}"
+      wt_path="${line#*$'\t'}"
+      echo "$label — $wt_path"
+    done <<< "$(printf '%s\n' "${wt_lines[@]}")" | fzf --height=20 --prompt='worktree> ' --no-info 2>/dev/null
+  )
+  if [[ -n "$wt_selection" ]]; then
+    dir="${wt_selection#* — }"
+    builtin cd "$dir" || _gitwt_die "cd failed: $dir"
+  fi
+  return 0 2>/dev/null || exit 0
+fi
+
+# Fallback: numbered menu for worktrees
+wt_choices=()
+n=1
+for line in "${wt_lines[@]}"; do
+  label="${line%%$'\t'*}"
+  wt_path="${line#*$'\t'}"
+  wt_choices+=("$wt_path")
+  echo "  $n) $label — $wt_path" >&2
+  ((n++))
+done
+echo "" >&2
+printf 'Choose worktree (number): ' >&2
+read -r num
+case "$num" in
+  *[!0-9]*) _gitwt_die "invalid worktree choice: $num" ;;
+  '')       _gitwt_die "invalid worktree choice" ;;
+esac
+if (( num >= 1 && num <= ${#wt_choices[@]} )); then
+  [[ -n "$ZSH_VERSION" ]] && dir="${wt_choices[num]}" || dir="${wt_choices[num - 1]}"
+  builtin cd "$dir" || _gitwt_die "cd failed: $dir"
+else
+  _gitwt_die "invalid worktree choice: $num"
+fi
+return 0 2>/dev/null || exit 0
